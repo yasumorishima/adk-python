@@ -4954,3 +4954,61 @@ async def test_content_to_message_param_anthropic_no_signature_falls_back():
   # Falls back to reasoning_content when no signatures present
   assert result.get("reasoning_content") == "thinking without sig"
   assert "thinking_blocks" not in result
+
+
+def test_message_to_generate_content_response_malformed_tool_call_json():
+  """Malformed tool call arguments should be skipped, not crash."""
+  message = ChatCompletionAssistantMessage(
+      role="assistant",
+      content=None,
+      tool_calls=[
+          ChatCompletionMessageToolCall(
+              type="function",
+              id="call_bad",
+              function=Function(
+                  name="broken_tool",
+                  arguments='{"a":"unterminated',
+              ),
+          ),
+          ChatCompletionMessageToolCall(
+              type="function",
+              id="call_good",
+              function=Function(
+                  name="valid_tool",
+                  arguments='{"key": "value"}',
+              ),
+          ),
+      ],
+  )
+
+  response = _message_to_generate_content_response(message)
+  assert response.content.role == "model"
+  # The malformed tool call should be skipped; only the valid one remains
+  function_parts = [
+      p for p in response.content.parts if p.function_call is not None
+  ]
+  assert len(function_parts) == 1
+  assert function_parts[0].function_call.name == "valid_tool"
+  assert function_parts[0].function_call.id == "call_good"
+
+
+def test_message_to_generate_content_response_all_malformed_tool_calls():
+  """When all tool calls have malformed JSON, response should have no parts."""
+  message = ChatCompletionAssistantMessage(
+      role="assistant",
+      content=None,
+      tool_calls=[
+          ChatCompletionMessageToolCall(
+              type="function",
+              id="call_1",
+              function=Function(
+                  name="broken",
+                  arguments="not json at all",
+              ),
+          ),
+      ],
+  )
+
+  response = _message_to_generate_content_response(message)
+  assert response.content.role == "model"
+  assert len(response.content.parts) == 0

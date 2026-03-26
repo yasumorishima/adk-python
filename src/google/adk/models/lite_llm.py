@@ -1712,9 +1712,19 @@ def _message_to_generate_content_response(
     for tool_call in tool_calls:
       if tool_call.type == "function":
         thought_signature = _extract_thought_signature_from_tool_call(tool_call)
+        try:
+          args = json.loads(tool_call.function.arguments or "{}")
+        except json.JSONDecodeError:
+          logger.warning(
+              "Skipping tool call %s(%s) with malformed JSON arguments: %s",
+              tool_call.function.name,
+              tool_call.id,
+              tool_call.function.arguments,
+          )
+          continue
         part = types.Part.from_function_call(
             name=tool_call.function.name,
-            args=json.loads(tool_call.function.arguments or "{}"),
+            args=args,
         )
         part.function_call.id = tool_call.id
         if thought_signature:
