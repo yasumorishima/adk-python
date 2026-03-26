@@ -1716,10 +1716,9 @@ def _message_to_generate_content_response(
           args = json.loads(tool_call.function.arguments or "{}")
         except json.JSONDecodeError:
           logger.warning(
-              "Skipping tool call %s(%s) with malformed JSON arguments: %s",
+              "Skipping tool call %s (id=REDACTED) with malformed JSON"
+              " arguments.",
               tool_call.function.name,
-              tool_call.id,
-              tool_call.function.arguments,
           )
           continue
         part = types.Part.from_function_call(
