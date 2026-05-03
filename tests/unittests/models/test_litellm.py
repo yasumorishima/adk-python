@@ -5012,3 +5012,60 @@ def test_message_to_generate_content_response_all_malformed_tool_calls():
   response = _message_to_generate_content_response(message)
   assert response.content.role == "model"
   assert len(response.content.parts) == 0
+
+
+
+def test_message_to_generate_content_response_tool_call_none_arguments():
+  """Tool call with arguments=None should produce a function call with empty args."""
+  message = ChatCompletionAssistantMessage(
+      role="assistant",
+      content=None,
+      tool_calls=[
+          ChatCompletionMessageToolCall(
+              type="function",
+              id="call_none_args",
+              function=Function(
+                  name="no_args_tool",
+                  arguments=None,
+              ),
+          ),
+      ],
+  )
+
+  response = _message_to_generate_content_response(message)
+  assert response.content.role == "model"
+  function_parts = [
+      p for p in response.content.parts if p.function_call is not None
+  ]
+  assert len(function_parts) == 1
+  assert function_parts[0].function_call.name == "no_args_tool"
+  assert function_parts[0].function_call.id == "call_none_args"
+  assert dict(function_parts[0].function_call.args) == {}
+
+
+def test_message_to_generate_content_response_tool_call_empty_string_arguments():
+  """Tool call with arguments='' should produce a function call with empty args."""
+  message = ChatCompletionAssistantMessage(
+      role="assistant",
+      content=None,
+      tool_calls=[
+          ChatCompletionMessageToolCall(
+              type="function",
+              id="call_empty_args",
+              function=Function(
+                  name="empty_args_tool",
+                  arguments="",
+              ),
+          ),
+      ],
+  )
+
+  response = _message_to_generate_content_response(message)
+  assert response.content.role == "model"
+  function_parts = [
+      p for p in response.content.parts if p.function_call is not None
+  ]
+  assert len(function_parts) == 1
+  assert function_parts[0].function_call.name == "empty_args_tool"
+  assert function_parts[0].function_call.id == "call_empty_args"
+  assert dict(function_parts[0].function_call.args) == {}
