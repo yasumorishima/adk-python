@@ -27,7 +27,6 @@ from ..utils.feature_decorator import experimental
 from .auth_credential import AuthCredential
 from .auth_credential import AuthCredentialTypes
 from .auth_provider_registry import AuthProviderRegistry
-from .auth_schemes import AuthScheme
 from .auth_schemes import AuthSchemeType
 from .auth_schemes import CustomAuthScheme
 from .auth_schemes import ExtendedOAuth2
@@ -35,7 +34,6 @@ from .auth_schemes import OpenIdConnectWithConfig
 from .auth_tool import AuthConfig
 from .base_auth_provider import BaseAuthProvider
 from .exchanger.base_credential_exchanger import BaseCredentialExchanger
-from .exchanger.base_credential_exchanger import ExchangeResult
 from .exchanger.credential_exchanger_registry import CredentialExchangerRegistry
 from .oauth2_discovery import OAuth2DiscoveryManager
 from .refresher.credential_refresher_registry import CredentialRefresherRegistry
@@ -44,7 +42,8 @@ logger = logging.getLogger("google_adk." + __name__)
 
 
 def _rehydrate_custom_scheme(
-    scheme: CustomAuthScheme, supported_schemes: Sequence[type[AuthScheme]]
+    scheme: CustomAuthScheme,
+    supported_schemes: Sequence[type[CustomAuthScheme]],
 ) -> CustomAuthScheme:
   """Rehydrate a CustomAuthScheme into one of the given supported_schemes."""
   incoming_type = scheme.type_
@@ -183,26 +182,34 @@ class CredentialManager:
   ) -> Optional[AuthCredential]:
     """Load and prepare authentication credential through a structured workflow."""
 
-    # Pydantic may have deserialized an unknown scheme into a generic
-    # CustomAuthScheme. If so, rehydrate it first into a specific subclass.
-    # Note: Custom authentication scheme classes must have been imported into
-    # the Python runtime before get_auth_credential is called for their
-    # subclasses to be registered. This is fine as developer will anyway import
-    # them while registering the auth providers.
-    # Note: `__subclasses__()` only returns immediate subclasses, if there is a
-    # subclass of a subclass of CustomAuthScheme then it will not be returned.
-    # pylint: disable=unidiomatic-typecheck Needs exact class matching.
-    if type(self._auth_config.auth_scheme) is CustomAuthScheme:
-      self._auth_config.auth_scheme = _rehydrate_custom_scheme(
-          self._auth_config.auth_scheme,
-          CustomAuthScheme.__subclasses__(),
+    # Step 0: Handle CustomAuthScheme if present
+    if isinstance(self._auth_config.auth_scheme, CustomAuthScheme):
+      # Pydantic may have deserialized an unknown scheme into a generic
+      # CustomAuthScheme. If so, rehydrate it first into a specific subclass.
+      # Note: Custom authentication scheme classes must have been imported into
+      # the Python runtime before get_auth_credential is called for their
+      # subclasses to be registered. This is fine as developer will anyway
+      # import them while registering the auth providers.
+      # Note: `__subclasses__()` only returns immediate subclasses, if there is
+      # a subclass of a subclass of CustomAuthScheme then it will not be
+      # returned.
+      # pylint: disable=unidiomatic-typecheck Needs exact class matching.
+      if type(self._auth_config.auth_scheme) is CustomAuthScheme:
+        self._auth_config.auth_scheme = _rehydrate_custom_scheme(
+            self._auth_config.auth_scheme,
+            CustomAuthScheme.__subclasses__(),
+        )
+
+      provider = self._auth_provider_registry.get_provider(
+          self._auth_config.auth_scheme
       )
-    # First, check if a registered auth provider is available before attempting
-    # to retrieve tokens natively.
-    provider = self._auth_provider_registry.get_provider(
-        self._auth_config.auth_scheme
-    )
-    if provider:
+      if provider is None:
+        raise ValueError(
+            "No auth provider registered for custom auth scheme "
+            f"{self._auth_config.auth_scheme.type_!r}. "
+            "Register it using `CredentialManager.register_auth_provider("
+            "<YourAuthProviderInstance>)`."
+        )
       provided_credential = await provider.get_auth_credential(
           self._auth_config, context
       )
@@ -224,10 +231,11 @@ class CredentialManager:
     await self._validate_credential()
 
     # Step 2: Check if credential is already ready (no processing needed)
-    if self._is_credential_ready():
+    raw_auth_credential = self._auth_config.raw_auth_credential
+    if self._is_credential_ready() and raw_auth_credential is not None:
       # Return a copy to avoid leaking mutations across invocations/users when
       # tools share a long-lived AuthConfig instance.
-      return self._auth_config.raw_auth_credential.model_copy(deep=True)
+      return raw_auth_credential.model_copy(deep=True)
 
     # Step 3: Try to load existing processed credential
     credential = await self._load_existing_credential(context)
@@ -431,7 +439,7 @@ class CredentialManager:
     auth_scheme = self._auth_config.auth_scheme
     if isinstance(auth_scheme, OAuth2):
       flows = auth_scheme.flows
-      return (
+      return bool(
           flows.implicit
           and not flows.implicit.authorizationUrl
           or flows.password

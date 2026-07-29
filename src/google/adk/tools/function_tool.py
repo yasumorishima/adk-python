@@ -14,12 +14,15 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 from typing import Any
 from typing import Callable
+from typing import cast
 from typing import get_args
 from typing import get_origin
+from typing import get_type_hints
 from typing import Optional
 from typing import Union
 
@@ -27,13 +30,42 @@ from google.genai import types
 import pydantic
 from typing_extensions import override
 
+from ..features import FeatureName
+from ..features import is_feature_enabled
+from ..utils._schema_utils import get_list_inner_type
+from ..utils._schema_utils import is_list_of_basemodel
 from ..utils.context_utils import Aclosing
 from ..utils.context_utils import find_context_parameter
+from ..utils.variant_utils import GoogleLLMVariant
 from ._automatic_function_calling_util import build_function_declaration
 from .base_tool import BaseTool
 from .tool_context import ToolContext
 
 logger = logging.getLogger('google_adk.' + __name__)
+
+
+@functools.lru_cache(maxsize=1024)
+def _build_declaration_cached(
+    func: Callable[..., Any],
+    ignore_params: tuple[str, ...],
+    variant: GoogleLLMVariant,
+    json_schema_enabled: bool,
+) -> types.FunctionDeclaration:
+  """Builds (and caches) a tool's FunctionDeclaration.
+
+  The build runs pydantic ``create_model`` + JSON-schema generation, which is
+  expensive and otherwise re-run for every tool on every LLM call even though
+  the result depends only on these (static) inputs. ``json_schema_enabled`` is
+  part of the key so toggling the feature flag rebuilds.
+  """
+  del json_schema_enabled  # Only participates in the cache key.
+  return types.FunctionDeclaration.model_validate(
+      build_function_declaration(
+          func=func,
+          ignore_params=list(ignore_params),
+          variant=variant,
+      )
+  )
 
 
 class FunctionTool(BaseTool):
@@ -88,17 +120,16 @@ class FunctionTool(BaseTool):
 
   @override
   def _get_declaration(self) -> Optional[types.FunctionDeclaration]:
-    function_decl = types.FunctionDeclaration.model_validate(
-        build_function_declaration(
-            func=self.func,
-            # The model doesn't understand the function context.
-            # input_stream is for streaming tool
-            ignore_params=self._ignore_params,
-            variant=self._api_variant,
-        )
+    # `ignore_params` drops the function context and input_stream (for streaming
+    # tools), which the model doesn't understand. Return a copy: the cached
+    # declaration is shared and callers (e.g. toolset prefixing) mutate it.
+    declaration = _build_declaration_cached(
+        self.func,
+        tuple(self._ignore_params),
+        self._api_variant,
+        is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL),
     )
-
-    return function_decl
+    return declaration.model_copy(deep=True)
 
   def _preprocess_args(self, args: dict[str, Any]) -> dict[str, Any]:
     """Preprocess and convert function arguments before invocation.
@@ -119,57 +150,124 @@ class FunctionTool(BaseTool):
     """
     signature = inspect.signature(self.func)
     converted_args = args.copy()
+    try:
+      type_hints = get_type_hints(self.func)
+    except (TypeError, NameError):
+      # NameError: unresolved forward refs (e.g. recursive type aliases).
+      # TypeError: non-function callables.
+      if hasattr(self.func, '__call__'):
+        try:
+          type_hints = get_type_hints(self.func.__call__)
+        except (TypeError, NameError):
+          type_hints = {}
+      else:
+        type_hints = {}
 
     for param_name, param in signature.parameters.items():
-      if param_name in args and param.annotation != inspect.Parameter.empty:
-        target_type = param.annotation
+      if param_name in args:
+        target_type = type_hints.get(param_name, param.annotation)
+        if target_type != inspect.Parameter.empty:
 
-        # Handle Optional[PydanticModel] types
-        if get_origin(param.annotation) is Union:
-          union_args = get_args(param.annotation)
-          # Find the non-None type in Optional[T] (which is Union[T, None])
-          non_none_types = [arg for arg in union_args if arg is not type(None)]
-          if len(non_none_types) == 1:
-            target_type = non_none_types[0]
+          # Handle Optional[PydanticModel] types
+          if get_origin(param.annotation) is Union:
+            union_args = get_args(param.annotation)
+            # Find the non-None type in Optional[T] (which is Union[T, None])
+            non_none_types = [
+                arg for arg in union_args if arg is not type(None)
+            ]
+            if len(non_none_types) == 1:
+              target_type = non_none_types[0]
+            elif len(non_none_types) > 1 and all(
+                inspect.isclass(t) and issubclass(t, pydantic.BaseModel)
+                for t in non_none_types
+            ):
+              if args[param_name] is None or isinstance(
+                  args[param_name], tuple(non_none_types)
+              ):
+                continue
+              try:
+                converted_args[param_name] = pydantic.TypeAdapter(
+                    param.annotation
+                ).validate_python(args[param_name])
+              except Exception as e:
+                logger.warning(
+                    f"Failed to convert argument '{param_name}' to"
+                    f' {param.annotation}: {e}'
+                )
+              continue
 
-        # Check if the target type is a Pydantic model
-        if inspect.isclass(target_type) and issubclass(
-            target_type, pydantic.BaseModel
-        ):
-          # Skip conversion if the value is None and the parameter is Optional
-          if args[param_name] is None:
-            continue
+          # Check if the target type is a Pydantic model
+          if inspect.isclass(target_type) and issubclass(
+              target_type, pydantic.BaseModel
+          ):
+            # Skip conversion if the value is None and the parameter is Optional
+            if args[param_name] is None:
+              continue
 
-          # Convert to Pydantic model if it's not already the correct type
-          if not isinstance(args[param_name], target_type):
-            try:
-              converted_args[param_name] = target_type.model_validate(
-                  args[param_name]
-              )
-            except Exception as e:
-              logger.warning(
-                  f"Failed to convert argument '{param_name}' to Pydantic model"
-                  f' {target_type.__name__}: {e}'
-              )
-              # Keep the original value if conversion fails
-              pass
+            # Convert to Pydantic model if it's not already the correct type
+            if not isinstance(args[param_name], target_type):
+              try:
+                converted_args[param_name] = target_type.model_validate(
+                    args[param_name]
+                )
+              except Exception as e:
+                logger.warning(
+                    f"Failed to convert argument '{param_name}' to Pydantic"
+                    f' model {target_type.__name__}: {e}'
+                )
+                # Keep the original value if conversion fails
+                pass
+          # Handle list[BaseModel] types
+          elif is_list_of_basemodel(target_type) and isinstance(
+              args[param_name], list
+          ):
+            item_type = get_list_inner_type(target_type)
+            if item_type is not None:
+              try:
+                converted_args[param_name] = [
+                    item_type.model_validate(item)
+                    if isinstance(item, dict)
+                    else item
+                    for item in args[param_name]
+                ]
+              except Exception as e:
+                logger.warning(
+                    f"Failed to convert argument '{param_name}' to"
+                    f' list[{item_type.__name__}]: {e}'
+                )
+                pass
 
     return converted_args
+
+  def _prepare_invocation_args(
+      self, args: dict[str, Any], tool_context: ToolContext
+  ) -> dict[str, Any]:
+    """Prepare args for function invocation (preprocesses, injects context and filters)."""
+    args_to_call = self._preprocess_args(args)
+    signature = inspect.signature(self.func)
+    valid_params = set(signature.parameters.keys())
+    if self._context_param_name in valid_params:
+      args_to_call[self._context_param_name] = tool_context
+    return {k: v for k, v in args_to_call.items() if k in valid_params}
+
+  @override
+  async def check_require_confirmation(
+      self, args: dict[str, Any], tool_context: ToolContext
+  ) -> bool:
+    if callable(self._require_confirmation):
+      args_to_call = self._prepare_invocation_args(args, tool_context)
+      return cast(
+          bool,
+          await self._invoke_callable(self._require_confirmation, args_to_call),
+      )
+    return bool(self._require_confirmation)
 
   @override
   async def run_async(
       self, *, args: dict[str, Any], tool_context: ToolContext
   ) -> Any:
     # Preprocess arguments (includes Pydantic model conversion)
-    args_to_call = self._preprocess_args(args)
-
-    signature = inspect.signature(self.func)
-    valid_params = {param for param in signature.parameters}
-    if self._context_param_name in valid_params:
-      args_to_call[self._context_param_name] = tool_context
-
-    # Filter args_to_call to only include valid parameters for the function
-    args_to_call = {k: v for k, v in args_to_call.items() if k in valid_params}
+    args_to_call = self._prepare_invocation_args(args, tool_context)
 
     # Before invoking the function, we check for if the list of args passed in
     # has all the mandatory arguments or not.
@@ -188,12 +286,9 @@ class FunctionTool(BaseTool):
 You could retry calling this tool, but it is IMPORTANT for you to provide all the mandatory parameters."""
       return {'error': error_str}
 
-    if isinstance(self._require_confirmation, Callable):
-      require_confirmation = await self._invoke_callable(
-          self._require_confirmation, args_to_call
-      )
-    else:
-      require_confirmation = bool(self._require_confirmation)
+    require_confirmation = await self.check_require_confirmation(
+        args, tool_context
+    )
 
     if require_confirmation:
       if not tool_context.tool_confirmation:
@@ -220,6 +315,12 @@ You could retry calling this tool, but it is IMPORTANT for you to provide all th
 
     return await self._invoke_callable(self.func, args_to_call)
 
+  def _detect_error_in_response(self, response: Any) -> Optional[str]:
+    """Telemetry hook: returns an error type if the response indicates an error."""
+    if isinstance(response, dict) and response.get('error'):
+      return 'TOOL_ERROR'
+    return None
+
   async def _invoke_callable(
       self, target: Callable[..., Any], args_to_call: dict[str, Any]
   ) -> Any:
@@ -237,7 +338,7 @@ You could retry calling this tool, but it is IMPORTANT for you to provide all th
     else:
       return target(**args_to_call)
 
-  # TODO(hangfei): fix call live for function stream.
+  # TODO: fix call live for function stream.
   async def _call_live(
       self,
       *,

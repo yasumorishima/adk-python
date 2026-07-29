@@ -96,6 +96,35 @@ def test_canonical_model_inherit():
   assert sub_agent.canonical_model == parent_agent.canonical_model
 
 
+def test_canonical_live_model_default_fallback():
+  original_default = LlmAgent._default_live_model
+  LlmAgent.set_default_live_model('gemini-2.0-flash')
+  try:
+    agent = LlmAgent(name='test_agent')
+    assert agent.canonical_live_model.model == 'gemini-2.0-flash'
+  finally:
+    LlmAgent.set_default_live_model(original_default)
+
+
+def test_canonical_live_model_str():
+  agent = LlmAgent(name='test_agent', model='gemini-pro')
+  assert agent.canonical_live_model.model == 'gemini-pro'
+
+
+def test_canonical_live_model_llm():
+  llm = LLMRegistry.new_llm('gemini-pro')
+  agent = LlmAgent(name='test_agent', model=llm)
+  assert agent.canonical_live_model == llm
+
+
+def test_canonical_live_model_inherit():
+  sub_agent = LlmAgent(name='sub_agent')
+  parent_agent = LlmAgent(
+      name='parent_agent', model='gemini-pro', sub_agents=[sub_agent]
+  )
+  assert sub_agent.canonical_live_model == parent_agent.canonical_live_model
+
+
 async def test_canonical_instruction_str():
   agent = LlmAgent(name='test_agent', instruction='instruction')
   ctx = await _create_readonly_context(agent)
@@ -298,6 +327,31 @@ def test_validate_generate_content_config_response_schema_throw():
             response_schema=Schema
         ),
     )
+
+
+def test_validate_generate_content_config_http_options_base_url_throw():
+  """Tests that a transport base URL cannot be set directly in config."""
+  with pytest.raises(ValueError):
+    _ = LlmAgent(
+        name='test_agent',
+        generate_content_config=types.GenerateContentConfig(
+            http_options=types.HttpOptions(base_url='http://example.invalid')
+        ),
+    )
+
+
+def test_validate_generate_content_config_http_options_allowed():
+  """Tests that request-time http options remain settable in config."""
+  extra_body = {'tool_config': {'function_calling_config': {'mode': 'AUTO'}}}
+  agent = LlmAgent(
+      name='test_agent',
+      generate_content_config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(timeout=1000, extra_body=extra_body)
+      ),
+  )
+
+  assert agent.generate_content_config.http_options.timeout == 1000
+  assert agent.generate_content_config.http_options.extra_body == extra_body
 
 
 def test_allow_transfer_by_default():
